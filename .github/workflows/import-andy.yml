@@ -1,0 +1,84 @@
+name: Import official Andy weights
+on:
+  push:
+    paths: [.github/workflows/import-andy.yml]
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency: andy-weight-import
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+      - name: Stream, split and publish the model
+        env:
+          TARGET_REPO: ${{ github.event.repository.name }}
+        shell: bash
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git config core.compression 0
+          git config pack.window 0
+          git config gc.auto 0
+          python3 -u - <<'PY'
+          import hashlib, json, os, pathlib, subprocess, time, urllib.request
+
+          models = {
+              'Andy4.2-Micro-Q4': ('Andy-4.2-Micro-GGUF', 'andy-4.2-micro.q4_k_m.gguf', 'Andy-4.2-Micro-Q4_K_M.gguf', 527502720, 'fa3f5e885e8d41d68d49394b490fe8d59c3448b23cbae176b3cdcb92a8d3cbb3'),
+              'Andy4.2-Air-Q4': ('Andy-4.2-Air-GGUF', 'andy-4.2-air.q4_k_m.gguf', 'Andy-4.2-Air-Q4_K_M.gguf', 2707513600, '4c6eed506ddf5a56f8135a9e607c9bb796e51188d34187fb9cbcbb8ccc586af4'),
+              'Andy4.2-9B-Q8': ('Andy-4.2-GGUF', 'andy-4.2.q8_0.gguf', 'Andy-4.2-Q8_0.gguf', 9527501120, 'e1a5d379d3a2b377d68cb299f20ea40d342256865b4ee1d84c1f78f840f001b9'),
+          }
+          name = os.environ['TARGET_REPO']
+          source, remote_file, output, size, expected = models[name]
+          def git(*args, **kw):
+              return subprocess.check_output(['git', *args], **kw).decode().strip()
+          if git('ls-files', 'manifest.json'):
+              print('Model is already published')
+              raise SystemExit(0)
+          existing = dict(line.split('\t', 1)[::-1] for line in git('ls-files', '-s', 'part-*.bin').splitlines())
+          def push(message):
+              git('commit', '-m', message)
+              for attempt in range(3):
+                  try:
+                      git('push', 'origin', 'HEAD:main')
+                      return
+                  except subprocess.CalledProcessError:
+                      if attempt == 2:
+                          raise
+                      time.sleep(5 * (attempt + 1))
+          sha = hashlib.sha256()
+          parts = []
+          total = pending = 0
+          url = f'https://huggingface.co/Mindcraft-CE/{source}/resolve/main/{remote_file}?download=true'
+          with urllib.request.urlopen(url, timeout=90) as stream:
+              while chunk := stream.read(64 * 1024**2):
+                  part = f'part-{len(parts):03d}.bin'
+                  parts.append(part)
+                  total += len(chunk)
+                  if total > size:
+                      raise ValueError('Model exceeds the official file size')
+                  sha.update(chunk)
+                  if part in existing:
+                      if git('hash-object', '--stdin', input=chunk) != existing[part].split()[1]:
+                          raise ValueError(f'Previously pushed part differs: {part}')
+                      continue
+                  blob = git('hash-object', '-w', '--stdin', input=chunk)
+                  git('update-index', '--add', '--cacheinfo', f'100644,{blob},{part}')
+                  pending += 1
+                  if pending == 16:
+                      push(f'Add model parts through {part}')
+                      print(f'Published {total:,} bytes')
+                      pending = 0
+          if total != size or sha.hexdigest() != expected:
+              raise ValueError('Official model SHA-256 or size mismatch')
+          with urllib.request.urlopen('https://huggingface.co/Mindcraft-CE/Andy-4.2-Air-GGUF/raw/main/LICENSE', timeout=30) as license_file:
+              pathlib.Path('LICENSE').write_bytes(license_file.read())
+          pathlib.Path('README.md').write_text(f'# {name}\n\nConcatenate the parts in manifest order to recover {output}.\n\nThis work uses data and models created by @Sweaterdog, and the Mindcraft Project\n')
+          pathlib.Path('manifest.json').write_text(json.dumps({'file':output,'size':size,'sha256':expected,'parts':parts}, indent=2) + '\n')
+          git('add', '--sparse', 'LICENSE', 'README.md', 'manifest.json')
+          push('Publish the verified Andy model manifest')
+          PY
